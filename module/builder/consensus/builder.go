@@ -227,38 +227,72 @@ func (b *Builder) BuildOn(parentID flow.Identifier, setter func(*flow.Header) er
 	// to at most the parent.
 
 	// create a mapping of block to seal for all seals in our pool
-	encounteredInconsistentSealsForSameBlock := false
 	byBlock := make(map[flow.Identifier]*flow.SealContainer)
+	duplicatedSeals := make(map[flow.Identifier][]*flow.SealContainer)   // seals for same block; ALL with SAME start and end state
+	inconsistentSeals := make(map[flow.Identifier][]*flow.SealContainer) // seals for same block, SOME of which have DIFFERENT start or end states
 	for _, sealContainer := range b.sealPool.All() {
 		seal := sealContainer.Seal
-		if sc2, found := byBlock[seal.BlockID]; found {
-			if len(sealContainer.ExecutionResult.Chunks) < 1 {
-				return nil, fmt.Errorf("ExecutionResult without chunks: %v", sealContainer.ExecutionResult.ID())
-			}
-			if len(sc2.ExecutionResult.Chunks) < 1 {
-				return nil, fmt.Errorf("ExecutionResult without chunks: %v", sc2.ExecutionResult.ID())
-			}
-			// only continue if both seals have same start AND end state:
-			if !bytes.Equal(sealContainer.Seal.FinalState, sc2.Seal.FinalState) ||
-				!bytes.Equal(sealContainer.ExecutionResult.Chunks[0].StartState, sc2.ExecutionResult.Chunks[0].StartState) {
-				sc1json, err := json.Marshal(sealContainer)
-				if err != nil {
-					return nil, err
-				}
-				sc2json, err := json.Marshal(sc2)
-				if err != nil {
-					return nil, err
-				}
-
-				fmt.Printf("ERROR: multiple seals for the same block %v: %s and %s", seal.BlockID, string(sc1json), string(sc2json))
-				encounteredInconsistentSealsForSameBlock = true
-			}
-		} else {
-			byBlock[seal.BlockID] = sealContainer
+		if sealList, found := inconsistentSeals[seal.BlockID]; found {
+			// we already have seals that are inconsistent: add this seal to the bucked of inconsistent seals
+			inconsistentSeals[seal.BlockID] = append(sealList, sealContainer)
+			continue
 		}
+		if sealList, found := duplicatedSeals[seal.BlockID]; found {
+			// we have seen duplicated seals: they are for _different_ results but the results have same start AND end state
+			consistent, err := b.areConsistentSeals(sealList[0], sealContainer)
+			if err != nil {
+				return nil, err
+			}
+			if !consistent {
+				// we encountered a seal that is _not_ consistent with the seals in sealList
+				// => move them all to inconsistentSeals
+				delete(duplicatedSeals, seal.BlockID)
+				inconsistentSeals[seal.BlockID] = append(sealList, sealContainer)
+			} else {
+				// we encountered a seal that is consistent with the seals in sealList
+				// => add to duplicatedSeals
+				duplicatedSeals[seal.BlockID] = append(sealList, sealContainer)
+			}
+			continue
+		}
+		if sc2, found := byBlock[seal.BlockID]; found {
+			// we have duplicated seals: for the same block, there are (probably) results with different IDs reported by different ENs
+			// This is indication of a _serious_ bug => do not seal such results
+			delete(byBlock, seal.BlockID)
+			consistent, err := b.areConsistentSeals(sc2, sealContainer)
+			if err != nil {
+				return nil, err
+			}
+			if !consistent {
+				inconsistentSeals[seal.BlockID] = []*flow.SealContainer{sc2, sealContainer}
+			} else {
+				duplicatedSeals[seal.BlockID] = []*flow.SealContainer{sc2, sealContainer}
+			}
+			continue
+		}
+		byBlock[seal.BlockID] = sealContainer
 	}
-	if encounteredInconsistentSealsForSameBlock {
-		byBlock = make(map[flow.Identifier]*flow.SealContainer)
+	for _, sealList := range duplicatedSeals {
+		msg := "WARNING: duplicated seals with consistent states but different IDs:"
+		for _, s := range sealList {
+			sjson, err := json.Marshal(s)
+			if err != nil {
+				return nil, err
+			}
+			msg += "\t" + string(sjson)
+		}
+		fmt.Printf(msg)
+	}
+	for _, sealList := range inconsistentSeals {
+		msg := "ERROR: seals with inconsistent states for same block:"
+		for _, s := range sealList {
+			sjson, err := json.Marshal(s)
+			if err != nil {
+				return nil, err
+			}
+			msg += "\t" + string(sjson)
+		}
+		fmt.Printf(msg)
 	}
 
 	// get the parent's block seal, which constitutes the beginning of the
@@ -423,4 +457,19 @@ func (b *Builder) BuildOn(parentID flow.Identifier, setter func(*flow.Header) er
 	}
 
 	return header, nil
+}
+
+func (b *Builder) areConsistentSeals(sc1, sc2 *flow.SealContainer) (bool, error) {
+	if len(sc1.ExecutionResult.Chunks) < 1 {
+		return false, fmt.Errorf("ExecutionResult without chunks: %v", sc1.ExecutionResult.ID())
+	}
+	if len(sc2.ExecutionResult.Chunks) < 1 {
+		return false, fmt.Errorf("ExecutionResult without chunks: %v", sc2.ExecutionResult.ID())
+	}
+	// only continue if both seals have same start AND end state:
+	if !bytes.Equal(sc1.Seal.FinalState, sc2.Seal.FinalState) ||
+		!bytes.Equal(sc1.ExecutionResult.Chunks[0].StartState, sc2.ExecutionResult.Chunks[0].StartState) {
+		return false, nil
+	}
+	return true, nil
 }
